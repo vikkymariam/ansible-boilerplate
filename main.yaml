@@ -1,0 +1,214 @@
+---
+- name: Set up application environment
+  hosts: hng
+  become: yes
+  vars:
+    admin_user: "admin_user_{{ ansible_date_time.iso8601_basic }}" # Example dynamic user
+    admin_password: "password1234" # Use a fixed password or generate a password securely outside the playbook
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600 # Cache valid for 1 hour
+
+    - name: Install required Python packages
+      apt:
+        name:
+          - python3-pip
+          - python3-venv
+          - python3-psycopg2
+        state: present
+
+    - name: Create user 'hng' with sudo privileges
+      user:
+        name: hng
+        shell: /bin/bash
+        create_home: yes
+        groups: sudo
+        append: yes
+
+    - name: Create directory /opt/stage_5b
+      file:
+        path: /opt/stage_5b
+        state: directory
+        owner: hng
+        group: hng
+        mode: '0755'
+
+    - name: Configure Git to trust the repository directory
+      command: git config --global --add safe.directory /opt/stage_5b
+
+    - name: Clone the devops branch of the repository
+      git:
+        repo: 'https://github.com/hngprojects/hng_boilerplate_nestjs.git'
+        version: devops
+        dest: /opt/stage_5b
+        force: yes
+
+    - name: Install PostgreSQL
+      apt:
+        name: postgresql
+        state: present
+        update_cache: yes
+
+    - name: Ensure PostgreSQL is running
+      shell: |
+        pg_isready
+      register: pg_isready
+      failed_when: pg_isready.rc != 0
+      changed_when: false
+
+    - name: Configure PostgreSQL to allow password authentication
+      lineinfile:
+        path: /etc/postgresql/14/main/pg_hba.conf
+        regexp: '^local\s+all\s+postgres\s+peer'
+        line: 'local   all             postgres                                md5'
+        state: present
+      notify: Restart PostgreSQL
+
+    - name: Ensure /var/secrets directory exists
+      file:
+        path: /var/secrets
+        state: directory
+        mode: '0700'
+        owner: hng
+        group: hng
+
+    - name: Create PostgreSQL admin credentials file
+      copy:
+        content: |
+          admin_user={{ admin_user }}
+          admin_password={{ admin_password }}
+        dest: /var/secrets/pg_pw.txt
+        owner: hng
+        group: hng
+        mode: '0600'
+
+    - name: Install Nginx
+      apt:
+        name: nginx
+        state: present
+
+    - name: Install Redis
+      apt:
+        name: redis-server
+        state: present
+        update_cache: yes
+
+    - name: Start Redis service
+      shell: |
+        sudo service redis-server start
+      register: redis_start
+      ignore_errors: yes
+
+    - name: Install Node.js and npm from NodeSource
+      apt_key:
+        url: https://deb.nodesource.com/gpgkey/nodesource.gpg.key
+        state: present
+
+    - name: Add Node.js 14.x repository
+      apt_repository:
+        repo: deb https://deb.nodesource.com/node_14.x {{ ansible_distribution_release }} main
+        state: present
+
+    - name: Clean package manager
+      shell: |
+        sudo apt-get clean
+        sudo apt-get autoremove -y
+        sudo apt-get -f install
+
+    - name: Install Node.js and npm
+      apt:
+        name: nodejs
+        state: present
+        update_cache: yes
+
+    - name: Ensure /opt/stage_5b/node_modules directory exists
+      file:
+        path: /opt/stage_5b/node_modules
+        state: directory
+        owner: hng
+        group: hng
+        mode: '0755'
+
+    - name: Install NestJS CLI locally in /opt/stage_5b
+      command: npm install -g @nestjs/cli
+      args:
+        chdir: /opt/stage_5b
+      environment:
+        PATH: "{{ ansible_env.PATH }}:/usr/local/bin"
+     
+    - name: Create log directory
+      file:
+        path: /var/log/stage_5b
+        state: directory
+        owner: hng
+        group: hng
+        mode: '0755'
+
+    - name: Create stderr log file
+      file:
+        path: /var/log/stage_5b/error.log
+        state: touch
+        owner: hng
+        group: hng
+        mode: '0644'
+
+    - name: Create stdout log file
+      file:
+        path: /var/log/stage_5b/out.log
+        state: touch
+        owner: hng
+        group: hng
+        mode: '0644'
+
+    - name: Run npm start with logging
+      command: npm start
+      args:
+        chdir: /opt/stage_5b
+      environment:
+        NODE_ENV: production
+      register: npm_start_output
+      
+    - name: Create systemd service for npm start
+      copy:
+        dest: /etc/systemd/system/npm_start.service
+        content: |
+          [Unit]
+          Description=NPM Start Service
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=hng
+          WorkingDirectory=/opt/stage_5b
+          ExecStart=/usr/bin/npm start
+          StandardOutput=file:/var/log/stage_5b/out.log
+          StandardError=file:/var/log/stage_5b/error.log
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Reload systemd manager configuration
+
+    - name: Start and enable npm start service
+      systemd:
+        name: npm_start
+        enabled: yes
+        state: started
+
+  handlers:
+    - name: Restart PostgreSQL
+      service:
+        name: postgresql
+        state: restarted
+
+    - name: Reload systemd manager configuration
+      systemd:
+        daemon_reload: yes
+
+    - name: Reload Nginx
+      service:
+        name: nginx
+        state: reloaded
